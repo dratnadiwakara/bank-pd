@@ -23,35 +23,53 @@ def assemble_inputs(
     conn: duckdb.DuckDBPyConnection,
     *,
     permco_filter: Optional[list[int]] = None,
+    rssd_filter: Optional[list[int]] = None,
     week_date_min: Optional[str] = None,
+    week_date_max: Optional[str] = None,
+    exclude_existing: bool = True,
 ) -> pd.DataFrame:
     """
-    Read compute-ready rows directly from `pd_input`.
+    Read compute-ready rows from `pd_input`, applying optional filters.
 
     `pd_input` already has every column the kernel needs plus the preserved
     identifiers; this function just renames `E_scaled -> E` and
     `market_cap -> market_cap_raw` for kernel-input compatibility.
+
+    Filters:
+      permco_filter / rssd_filter: list of ids to include.
+      week_date_min / week_date_max: inclusive bounds on week_date.
+      exclude_existing: when True (default), drop (week_date, permco)
+        pairs already present in pd_panel — incremental compute.
     """
-    wheres = []
+    wheres = [
+        "sE IS NOT NULL",
+        "market_cap IS NOT NULL",
+        "market_cap > 0",
+        "total_liab IS NOT NULL",
+        "total_liab > 0",
+        "r IS NOT NULL",
+    ]
     params: list = []
     if permco_filter:
         placeholders = ",".join(str(int(p)) for p in permco_filter)
         wheres.append(f"permco IN ({placeholders})")
+    if rssd_filter:
+        placeholders = ",".join(str(int(r)) for r in rssd_filter)
+        wheres.append(f"rssd IN ({placeholders})")
     if week_date_min:
         wheres.append("week_date >= ?")
         params.append(week_date_min)
-    where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
+    if week_date_max:
+        wheres.append("week_date <= ?")
+        params.append(week_date_max)
 
-    extra = (
-        "sE IS NOT NULL "
-        "AND market_cap IS NOT NULL AND market_cap > 0 "
-        "AND total_liab IS NOT NULL AND total_liab > 0 "
-        "AND r IS NOT NULL"
-    )
-    if where_sql:
-        where_sql += f" AND {extra}"
-    else:
-        where_sql = f"WHERE {extra}"
+    where_sql = "WHERE " + " AND ".join(wheres)
+    excl_sql = ""
+    if exclude_existing:
+        excl_sql = (
+            "AND (week_date, permco) NOT IN "
+            "(SELECT week_date, permco FROM pd_panel)"
+        )
 
     sql = f"""
     SELECT
@@ -69,6 +87,7 @@ def assemble_inputs(
       E_scaled   AS E
     FROM pd_input
     {where_sql}
+    {excl_sql}
     ORDER BY permco, week_date
     """
     return conn.execute(sql, params).fetchdf()

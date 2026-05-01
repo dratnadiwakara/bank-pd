@@ -86,3 +86,58 @@ def link_permcos(
         f"SELECT DISTINCT permco FROM crsp_link {where} ORDER BY permco"
     ).fetchall()
     return [int(r[0]) for r in rows]
+
+
+def permcos_for_rssds(
+    conn: duckdb.DuckDBPyConnection,
+    rssds: list[int],
+) -> list[int]:
+    """Resolve a list of RSSDs to their permcos via crsp_link."""
+    if not rssds:
+        return []
+    placeholders = ",".join(str(int(r)) for r in rssds)
+    rows = conn.execute(
+        f"SELECT DISTINCT permco FROM crsp_link WHERE rssd IN ({placeholders}) ORDER BY permco"
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def top_n_rssds_by_assets(
+    conn: duckdb.DuckDBPyConnection,
+    n: int,
+) -> list[int]:
+    """
+    Return the top-N RSSDs by total assets, using each RSSD's most recent
+    Y-9C quarter (so large banks aren't missed when the very latest quarter
+    is sparsely populated).
+
+    Filters to RSSDs that appear in `crsp_link` (i.e., listed banks with a
+    CRSP permco).
+    """
+    from . import config
+    from .db import attach_external, detach
+    attach_external(conn, "ext_y9c", config.y9c_db_path())
+    try:
+        sql = """
+        WITH latest_per_bank AS (
+          SELECT id_rssd, MAX(date) AS d
+          FROM ext_y9c.bs_panel_y9c
+          WHERE assets IS NOT NULL
+          GROUP BY id_rssd
+        ),
+        ranked AS (
+          SELECT y.id_rssd, y.assets, y.date
+          FROM ext_y9c.bs_panel_y9c y
+          JOIN latest_per_bank l
+            ON y.id_rssd = l.id_rssd AND y.date = l.d
+          WHERE y.id_rssd IN (SELECT DISTINCT rssd FROM crsp_link WHERE confirmed)
+        )
+        SELECT id_rssd
+        FROM ranked
+        ORDER BY assets DESC
+        LIMIT ?
+        """
+        rows = conn.execute(sql, [int(n)]).fetchall()
+        return [int(r[0]) for r in rows]
+    finally:
+        detach(conn, "ext_y9c")

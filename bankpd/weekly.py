@@ -38,14 +38,26 @@ def build_fred_weekly(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> int:
+    """Generate Fridays through today, ASOF-pull latest fred_dgs10.r_decimal.
+
+    Note: end is `today` (not MAX(fred_dgs10.date)) so Fridays past FRED's
+    last update still get a row — ASOF forward-fills `r` from the most
+    recent available DGS10 reading. Otherwise pd_input rows for the most
+    recent Friday end up with `r=NULL` and become ineligible for compute
+    until FRED publishes the same-day yield.
+    """
+    from datetime import date as _date
     start = start_date or config.START_DATE
     if end_date is None:
-        row = conn.execute("SELECT MAX(date) FROM fred_dgs10").fetchone()
-        if row is None or row[0] is None:
-            return 0
-        end = row[0].strftime("%Y-%m-%d") if hasattr(row[0], "strftime") else str(row[0])
+        end = _date.today().strftime("%Y-%m-%d")
     else:
         end = end_date
+
+    # Bail out cleanly if fred_dgs10 has nothing yet — Friday calendar can't
+    # populate r without source data.
+    row = conn.execute("SELECT COUNT(*) FROM fred_dgs10").fetchone()
+    if not row or not row[0]:
+        return 0
 
     sql = f"""
     WITH fridays AS (
@@ -99,6 +111,8 @@ def build_pd_input(
             date,
             price,
             market_cap,
+            source        AS data_source,
+            provider_id,
             STDDEV_SAMP(retx) OVER (
               PARTITION BY permco
               ORDER BY date
@@ -109,10 +123,10 @@ def build_pd_input(
               ORDER BY date
               ROWS BETWEEN {config.VOL_WINDOW - 1} PRECEDING AND CURRENT ROW
             ) AS n_obs_252
-          FROM crsp_daily
+          FROM crsp_daily_combined
         ),
         permco_bounds AS (
-          SELECT permco, MIN(date) AS first_date FROM crsp_daily GROUP BY permco
+          SELECT permco, MIN(date) AS first_date FROM crsp_daily_combined GROUP BY permco
         ),
         fridays AS (
           {_generate_friday_calendar_sql(start, end)}
@@ -128,6 +142,8 @@ def build_pd_input(
                  d.date AS date_eff,
                  d.price,
                  d.market_cap,
+                 d.data_source,
+                 d.provider_id,
                  CASE WHEN d.n_obs_252 >= {config.VOL_MIN_PERIODS} THEN d.sE_raw END AS sE,
                  d.n_obs_252
           FROM permco_fridays pf
@@ -141,19 +157,21 @@ def build_pd_input(
             ON cl.permco = cr.permco AND cr.week_date >= cl.quarter_end
         ),
         ticker_candidates AS (
+          -- "most recent name as of week_date": all rows that started by then,
+          -- ranked latest first. Drops the `nameenddt >= week_date` filter so
+          -- stale Fridays (past CRSP coverage) still get the last-known ticker.
           SELECT wl.permco, wl.week_date, t.permno, t.ticker, t.namedt, t.nameenddt
           FROM with_link wl
           JOIN crsp_ticker_hist t
             ON t.permco = wl.permco
-           AND t.namedt    <= wl.week_date
-           AND t.nameenddt >= wl.week_date
+           AND t.namedt <= wl.week_date
         ),
         ticker_ranked AS (
           SELECT
             permco, week_date, permno, ticker,
             ROW_NUMBER() OVER (
               PARTITION BY permco, week_date
-              ORDER BY nameenddt DESC, namedt DESC, ticker ASC
+              ORDER BY namedt DESC, nameenddt DESC, ticker ASC
             ) AS rn
           FROM ticker_candidates
         ),
@@ -195,8 +213,7 @@ def build_pd_input(
         SELECT
           permco,
           week_date,
-          CASE WHEN crsp_lag_days IS NULL OR crsp_lag_days > {config.CRSP_STALE_DAYS}
-               THEN NULL ELSE date_eff END AS date_eff,
+          date_eff,                                     -- always populated (last known CRSP date)
           rssd,
           ticker,
           permno,
@@ -223,7 +240,9 @@ def build_pd_input(
           y9c_age_days,
           (y9c_age_days IS NOT NULL AND y9c_age_days > {config.Y9C_STALE_DAYS}) AS y9c_stale,
           crsp_lag_days,
-          (crsp_lag_days IS NULL OR crsp_lag_days > {config.CRSP_STALE_DAYS}) AS crsp_stale
+          (crsp_lag_days IS NULL OR crsp_lag_days > {config.CRSP_STALE_DAYS}) AS crsp_stale,
+          data_source,
+          provider_id
         FROM flagged
         WHERE rssd IS NOT NULL
         """
@@ -236,7 +255,8 @@ def build_pd_input(
               market_cap, price, sE, n_obs_252, r,
               y9c_quarter_end, total_liab, assets, equity, E_scaled,
               year, month,
-              y9c_age_days, y9c_stale, crsp_lag_days, crsp_stale
+              y9c_age_days, y9c_stale, crsp_lag_days, crsp_stale,
+              data_source, provider_id
             )
             """ + sql
         )

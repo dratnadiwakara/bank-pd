@@ -48,8 +48,9 @@ VOL_MIN_PERIODS = 126
 
 # ── Data-freshness thresholds ────────────────────────────────────────────────
 
-Y9C_STALE_DAYS = int(os.getenv("BANK_PD_Y9C_STALE_DAYS", "45"))
+Y9C_STALE_DAYS  = int(os.getenv("BANK_PD_Y9C_STALE_DAYS", "45"))
 CRSP_STALE_DAYS = int(os.getenv("BANK_PD_CRSP_STALE_DAYS", "7"))
+LINK_STALE_DAYS = int(os.getenv("BANK_PD_LINK_STALE_DAYS", "365"))
 
 # ── DuckDB tuning ────────────────────────────────────────────────────────────
 

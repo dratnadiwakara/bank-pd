@@ -29,6 +29,8 @@ class FreshnessReport:
     y9c_age_days: Optional[int] = None
     y9c_stale: bool = False
     link_max_quarter_end: Optional[date] = None
+    link_age_days: Optional[int] = None
+    link_stale: bool = False
     pd_input_max_week: Optional[date] = None
     pd_input_total_rows: int = 0
     pd_input_stale_y9c_rows: int = 0
@@ -87,6 +89,20 @@ def check(conn: duckdb.DuckDBPyConnection) -> FreshnessReport:
     rep.link_max_quarter_end = _to_date(
         conn.execute("SELECT MAX(quarter_end) FROM crsp_link").fetchone()[0]
     )
+    if rep.link_max_quarter_end is not None:
+        rep.link_age_days = (today - rep.link_max_quarter_end).days
+        rep.link_stale = rep.link_age_days > config.LINK_STALE_DAYS
+        if rep.link_stale:
+            rep.warnings.append(
+                f"crsp_link is {rep.link_age_days} days past its latest "
+                f"quarter-end ({rep.link_max_quarter_end.isoformat()}); "
+                f"threshold {config.LINK_STALE_DAYS}. Refresh sibling repo "
+                "empirical-data-construction (permco-rssd-link CSV from NY "
+                "Fed) before computing PDs — silent BHC re-mapping risk."
+            )
+    else:
+        rep.warnings.append("crsp_link is empty.")
+        rep.link_stale = True
 
     attach_external(conn, "ext_y9c", config.y9c_db_path())
     try:
@@ -124,6 +140,46 @@ def check(conn: duckdb.DuckDBPyConnection) -> FreshnessReport:
     rep.pd_input_stale_crsp_rows = int(row[3] or 0)
 
     return rep
+
+
+def assert_not_stale(
+    rep: FreshnessReport,
+    *,
+    ignore_stale: bool = False,
+    check_y9c: bool = True,
+    check_link: bool = True,
+) -> None:
+    """Raise SystemExit if any required source is past its staleness
+    threshold. Pipeline / import commands call this between
+    `freshness.check()` and any heavy fetch / compute work.
+
+    `ignore_stale=True` bypasses the gates (operator override)."""
+    if ignore_stale:
+        return
+    blockers: list[str] = []
+    if check_link and rep.link_stale:
+        if rep.link_max_quarter_end is None:
+            blockers.append(
+                "ABORT: crsp_link is empty. Run `bankpd update-inputs` "
+                "first (or refresh sibling repo empirical-data-construction)."
+            )
+        else:
+            blockers.append(
+                f"ABORT: crsp_link is {rep.link_age_days} days past its "
+                f"latest quarter-end ({rep.link_max_quarter_end.isoformat()}); "
+                f"threshold {config.LINK_STALE_DAYS} days. "
+                "Refresh the sibling repo permco-rssd-link CSV from NY Fed "
+                "and rerun. PD computation against a stale link risks silent "
+                "BHC re-mapping. Pass --ignore-stale to override."
+            )
+    if check_y9c and rep.y9c_stale:
+        blockers.append(
+            f"ABORT: Y-9C is {rep.y9c_age_days} days past its latest "
+            f"quarter-end (threshold {config.Y9C_STALE_DAYS}). Refresh "
+            "sibling repo empirical-data-construction or pass --ignore-stale."
+        )
+    if blockers:
+        raise SystemExit("\n".join(blockers))
 
 
 def _icon(ok: bool) -> str:
@@ -167,7 +223,13 @@ def format_report(r: FreshnessReport) -> str:
         out.append("Y-9C panel:        (unreachable)  !!")
 
     if r.link_max_quarter_end is not None:
-        out.append(f"crsp_link:         latest q-end {r.link_max_quarter_end.isoformat()}")
+        out.append(
+            f"crsp_link:         latest q-end {r.link_max_quarter_end.isoformat()} "
+            f"(age {r.link_age_days:>4} days)  "
+            f"{_icon(not r.link_stale)}{'' if not r.link_stale else 'STALE'}"
+        )
+    else:
+        out.append("crsp_link:         (empty)  !!")
 
     if r.pd_input_max_week is not None:
         out.append(

@@ -43,40 +43,89 @@ Required Python packages: `duckdb`, `pandas`, `numpy`, `scipy`, `wrds`, `request
 
 ## Run
 
-### Single-bank smoke test (Bank of America)
+The pipeline exposes four task-aligned commands.
+
+### Task 1: update inputs (all banks, up to last Friday)
 
 ```
-python -m bankpd.cli run-all --scope boa
+python -m bankpd.cli update-inputs
 ```
 
-Pulls only BoA's CRSP daily, computes ~1,250 weekly observations.
+Fetches FRED DGS10, CRSP daily, and ticker history for **all link permcos**.
+Rebuilds `pd_input`. Aborts if Y-9C is stale beyond 45 days (override with
+`--ignore-stale`). Prints freshness + coverage diagnostics at the end —
+including the count of banks with compute-eligible rows for last Friday.
 
-### All listed banks (full panel)
-
-```
-python -m bankpd.cli run-all --scope all
-```
-
-First run is heavy (CRSP daily for ~5,000 permcos). Subsequent runs are incremental — only new Fridays get fetched and computed.
-
-### Resolve BoA ids without computing
+### Task 2: weekly compute (strict)
 
 ```
-python -m bankpd.cli show-boa
+python -m bankpd.cli compute-weekly
 ```
 
-### Pre-flight freshness report
+Computes PDs for **all banks up to last Friday**. Strict: aborts if
+`pd_input` has no compute-eligible rows for last Friday (run
+`update-inputs` first), or if Y-9C is stale (override with
+`--ignore-stale`).
+
+### Task 3: backfill from a date
 
 ```
-python -m bankpd.cli freshness
+python -m bankpd.cli compute --since 2024-01-01
 ```
 
-Prints lag of every input source. Always exits 0. `run-all` runs the same
-check internally and **aborts** when Y-9C is stale beyond threshold
-(default 45 days past latest quarter end). Pass `--ignore-stale` to
-override (e.g., for backfills). CRSP staleness (default 7 days past
-today) is non-fatal — affected Fridays end up with NULL market data in
-`pd_input` and are skipped at compute.
+Computes PDs for all banks from `--since` (inclusive) onward. If
+`--since` is omitted, uses the earliest week in `pd_input`. No staleness
+gate — fills in whatever `pd_input` rows are eligible and missing from
+`pd_panel`.
+
+### Task 4: compute for specific banks
+
+```
+python -m bankpd.cli compute --rssd 1073757,1027004
+```
+
+Same as Task 3 but restricted to listed RSSDs. Combine with `--since` /
+`--until` for windowing. Pass `--recompute` to overwrite existing
+`pd_panel` rows.
+
+### Diagnostics
+
+```
+python -m bankpd.cli inputs-status   # freshness + coverage, read-only
+python -m bankpd.cli freshness       # input-source lag only
+python -m bankpd.cli show-boa        # resolve BoA permco/RSSD
+```
+
+`inputs-status` is the right starting point: it tells you whether to run
+`update-inputs`, what `compute-weekly` would do, and how many
+`(week_date, permco)` pairs are pending compute.
+
+### Bloomberg overlay (fill stale CRSP weeks)
+
+```
+python -m bankpd.cli import-bloomberg path/to/bbg.xlsx [--ticker-map BAC=3151]
+python -m bankpd.cli prune-overlay
+```
+
+Bloomberg xlsx schema (4 cols, header row 0):
+`ID_BB_UNIQUE | TICKER | DATE | CUR_MKT_CAP_USD` (USD millions).
+
+Overlay rows go into `crsp_daily_overlay`; `pd_input` reads through view
+`crsp_daily_combined` (WRDS wins, overlay fills gaps). Source recorded
+in `pd_input.data_source` and `pd_input.provider_id`.
+
+### Yahoo Finance overlay (free alternative)
+
+```
+python -m bankpd.cli import-yfinance --rssd 1073757,1039502
+python -m bankpd.cli import-yfinance               # all stale permcos
+```
+
+Pulls `close × shares_outstanding` from yfinance and writes overlay rows
+with `source='yfinance'`. No API key. Per-permco `since` defaults to
+last day in `crsp_daily_combined` for that permco → **one-day overlap**
+with existing data is used as a consistency check. Mismatch > 10% on
+any ticker aborts the whole import (signals broken ticker mapping).
 
 ## Query examples (DuckDB CLI)
 
@@ -115,15 +164,21 @@ ORDER BY market_cap DESC LIMIT 50;
 
 ## Pipeline stages
 
-1. `init_schema` – ensure local DDL exists
-2. `refresh_link_table` – mirror external link DB to `crsp_link`
-3. `fetch_dgs10_incremental` – append new FRED DGS10 days
-4. `fetch_crsp_daily_incremental` – append new CRSP days per permco (WRDS)
-5. `fetch_crsp_tickers` – refresh ticker history (`crsp.stocknames`, common stock) for every permco present in `crsp_daily`
-6. `build_fred_weekly` – Friday spot DGS10
-7. `build_pd_input` – consolidated input panel: 252-day backward rolling vol on the daily grid → pick last trading day per Friday → ASOF-join crsp_link, Y-9C panel, fred_weekly, ticker history. Filtered to compute-ready rows (sE finite, total_liab>0, etc.)
-8. `assemble_inputs` – read compute-ready rows from `pd_input` (incremental for new weeks)
-9. `run_compute` + `upsert_pd_panel` – run NP value-surface + classic Merton kernels, INSERT OR REPLACE keyed `(week_date, permco)`
+`update-inputs`:
+
+1. `init_schema`
+2. `freshness.check` (aborts on stale Y-9C)
+3. `refresh_link_table` – mirror external link DB to `crsp_link`
+4. `fetch_dgs10_incremental` – append new FRED DGS10 days
+5. `fetch_crsp_daily_incremental` – append new CRSP days per permco (WRDS), for all link permcos
+6. `fetch_crsp_tickers` – refresh ticker history (`crsp.stocknames`, common stock) for every permco present in `crsp_daily`
+7. `build_fred_weekly` – Friday spot DGS10
+8. `build_pd_input` – consolidated input panel: 252-day backward rolling vol on the daily grid → pick last trading day per Friday → ASOF-join `crsp_link`, Y-9C panel, `fred_weekly`, ticker history. Anchored on every Friday between each permco's first CRSP date and today; market data NULL'd when CRSP lag > 7 days.
+
+`compute-weekly` / `compute`:
+
+9. `assemble_inputs` – read compute-ready rows from `pd_input` (filtered by `--since` / `--until` / `--rssd`; skips `(week_date, permco)` pairs already in `pd_panel` unless `--recompute`)
+10. `run_compute` + `upsert_pd_panel` – run NP value-surface + classic Merton kernels, INSERT OR REPLACE keyed `(week_date, permco)`
 
 ## Conventions
 

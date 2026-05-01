@@ -38,6 +38,41 @@ CREATE TABLE IF NOT EXISTS crsp_daily (
 );
 CREATE INDEX IF NOT EXISTS ix_crsp_daily_date ON crsp_daily(date);
 
+CREATE TABLE IF NOT EXISTS crsp_daily_overlay (
+  permco         INTEGER NOT NULL,
+  date           DATE    NOT NULL,
+  market_cap     DOUBLE,             -- thousands of USD (CRSP convention)
+  retx           DOUBLE,
+  retx_synthetic BOOLEAN,            -- TRUE when prev trading day was >1 day before
+  source         TEXT,               -- 'bloomberg' | 'yfinance' | (future)
+  provider_id    TEXT,               -- ID_BB_UNIQUE / yf ticker / etc.
+  ticker_raw     TEXT,
+  loaded_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  loaded_from    TEXT,
+  PRIMARY KEY (permco, date)
+);
+CREATE INDEX IF NOT EXISTS ix_overlay_date ON crsp_daily_overlay(date);
+
+CREATE OR REPLACE VIEW crsp_daily_combined AS
+  SELECT permco, date,
+         price, ret, retx, shrout, market_cap,
+         'crsp' AS source,
+         CAST(NULL AS TEXT) AS provider_id
+    FROM crsp_daily
+  UNION ALL
+  SELECT o.permco, o.date,
+         CAST(NULL AS DOUBLE) AS price,
+         CAST(NULL AS DOUBLE) AS ret,
+         o.retx,
+         CAST(NULL AS DOUBLE) AS shrout,
+         o.market_cap,
+         o.source,
+         o.provider_id
+    FROM crsp_daily_overlay o
+   WHERE NOT EXISTS (
+     SELECT 1 FROM crsp_daily c
+      WHERE c.permco = o.permco AND c.date = o.date);
+
 CREATE TABLE IF NOT EXISTS crsp_link (
   permco INTEGER NOT NULL,
   rssd   INTEGER NOT NULL,
@@ -82,6 +117,8 @@ CREATE TABLE IF NOT EXISTS pd_input (
   y9c_stale     BOOLEAN,
   crsp_lag_days INTEGER,
   crsp_stale    BOOLEAN,
+  data_source   TEXT,                       -- 'crsp' | 'bloomberg' | 'yfinance' at date_eff
+  provider_id   TEXT,                       -- vendor ID when data_source != 'crsp'
   built_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (permco, week_date)
 );

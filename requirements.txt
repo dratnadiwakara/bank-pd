@@ -10,7 +10,9 @@ requests>=2.31
 pyyaml>=6.0
 python-dateutil>=2.8
 matplotlib>=3.7
+openpyxl>=3.1
 pytest>=7
+yfinance>=0.2
 
 # WRDS client and its runtime deps (avoid pandas 2.2 pin via --no-deps)
 psycopg2-binary>=2.9

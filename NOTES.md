@@ -5,6 +5,216 @@ Newest entries on top.
 
 ---
 
+## 2026-05-01 (evening) — crsp_link staleness gate (1-year hard threshold)
+
+`crsp_link` (PERMCO ↔ BHC RSSD mapping) silently forward-fills via the
+ASOF join in `build_pd_input`. If the local mirror is more than ~year
+old, ticker → permco → rssd resolution can lock onto the wrong BHC after
+M&A / re-orgs, and Y-9C balance sheets get joined to the wrong bank.
+Added a hard staleness gate:
+
+- New config: `LINK_STALE_DAYS = 365` (env override
+  `BANK_PD_LINK_STALE_DAYS`).
+- `freshness.FreshnessReport` gains `link_age_days`, `link_stale`.
+  Format-report shows OK / STALE alongside Y-9C.
+- New helper `freshness.assert_not_stale(rep, ignore_stale, check_y9c,
+  check_link)` — single point that any pipeline / import command calls
+  after `freshness.check()` to abort cleanly with `SystemExit(1)`.
+- All compute / import commands now gate on it:
+  - `update-inputs`: Y-9C check before refresh (sibling-repo source);
+    link check **after** refresh (because the command's job is to
+    refresh the mirror — only abort if even a fresh mirror is stale,
+    i.e., NY Fed CSV in sibling repo is itself stale).
+  - `compute-weekly`, `compute`, `import-yfinance`, `import-bloomberg`:
+    abort if link stale (no refresh available; tells user to run
+    `update-inputs` first or refresh sibling repo).
+- All commands gain `--ignore-stale` flag for operator override
+  (backfills, reproductions of historical states).
+- `inputs-status` and `freshness` themselves never abort — they're
+  diagnostic.
+
+Why `import-yfinance` / `import-bloomberg` need the link check: ticker
+→ permno → permco → rssd resolution all flows through `crsp_link` (and
+`crsp_ticker_hist`, which is itself driven by the link permco list at
+fetch time). A stale link silently mis-routes Bloomberg / yfinance rows
+to the wrong bank.
+
+Y-9C check is intentionally NOT enforced on the import commands —
+overlay imports are a market-data path, Y-9C balance-sheet staleness
+doesn't directly corrupt them. (compute commands still check Y-9C.)
+
+---
+
+## 2026-05-01 (later afternoon) — Yahoo Finance overlay + multi-source generalisation
+
+WRDS lags >1 year; Bloomberg overlay requires a paid terminal. Added free
+**yfinance** path for stale-CRSP fill.
+
+**Schema change**: generalised `crsp_daily_overlay` from bloomberg-only:
+- Renamed `bbg_unique_id` → `provider_id`
+- Added `source TEXT` column (`'bloomberg' | 'yfinance' | …`)
+- Same rename on `pd_input` (`bbg_unique_id` → `provider_id`)
+- View `crsp_daily_combined` now passes `source` from the overlay row
+  directly instead of hard-coding `'bloomberg'`.
+
+**Refactor**: extracted shared overlay helpers into `bankpd/_overlay.py`
+(`compute_retx_for_overlay`, `resolve_tickers_via_db`,
+`resolve_permnos_to_permcos`, `as_date`, `insert_overlay`,
+`prune_overlay`, `latest_known_date_per_permco`, `existing_market_caps`).
+Both `bbg.py` and `yfdata.py` use them. Each importer now does only its
+vendor-specific bits (xlsx parsing for bbg; yfinance API call + alias
+map for yf).
+
+**`bankpd/yfdata.py`**:
+- Resolves rssd → permco → ticker via `crsp_ticker_hist`
+- Applies `CRSP_TO_YF_ALIASES` (BRK.B → BRK-B, etc.); operator can extend
+  via `--ticker-map CRSP=YF`
+- For each permco, `since` defaults to the per-permco
+  `MAX(crsp_daily_combined.date)` so the import has a **one-day overlap**
+  with existing data
+- Pulls `Ticker.history(close)` × `Ticker.get_shares_full()`,
+  market_cap = (close × shares) / 1000 (raw USD → thousands)
+- `auto_adjust=False` to keep raw close × shares semantics matching CRSP
+
+**Overlap consistency check** (per user requirement):
+- For each permco's first yfinance row on `last_known_date`, compare to
+  existing `crsp_daily_combined.market_cap`
+- ≤ 1% (default) — OK
+- 1–10% — soft WARN, continues
+- > 10% — **ABORT entire import** (no rows for any ticker). Signals a
+  fundamental ticker / permco / split issue. Override with
+  `--skip-overlap-check`. Exit code 1 so cron / CI sees failure.
+
+CLI: `bankpd import-yfinance [--rssd … | --permco …] [--since DATE]
+[--until DATE] [--ticker-map CRSP=YF] [--overlap-tolerance 0.01]
+[--skip-overlap-check] [--no-rebuild]`.
+
+**Diagnostics** (`inputs-status`) now shows per-source breakdown:
+`crsp_daily_overlay: N rows (4 bloomberg + 35 yfinance; 39 active in
+view, latest 2026-05-01)` and
+`pd_input by source: 1304 crsp + 70 bloomberg + 35 yfinance`.
+
+**Workflow**:
+```
+1. bankpd update-inputs --top-n 8        # fetch WRDS, build pd_input
+2. bankpd import-yfinance                # fill stale tail (auto-detects)
+3. bankpd compute-weekly                  # compute PDs through last Friday
+```
+
+If WRDS lags > 7 days, step 2 closes the gap.
+
+---
+
+## 2026-05-01 (afternoon) — Bloomberg market-cap overlay
+
+WRDS CRSP daily lags 1+ week. To compute PDs for the latest Friday before
+WRDS catches up, accept a Bloomberg market-cap snapshot from the user.
+
+Bloomberg xlsx schema (4 cols, header row 0):
+```
+ID_BB_UNIQUE | TICKER | DATE | CUR_MKT_CAP_USD
+```
+
+`CUR_MKT_CAP_USD` is millions of USD (Bloomberg default); converted to
+thousands at import to match CRSP `market_cap` units.
+
+**New table** `crsp_daily_overlay` (keyed `(permco, date)`) — keeps
+provenance (`bbg_unique_id`, `ticker_raw`, `loaded_from`) without
+polluting the WRDS-shaped `crsp_daily` table.
+
+**New view** `crsp_daily_combined` — WRDS rows preferred, overlay rows
+fill gaps. `build_pd_input` now reads from this view. Once WRDS catches
+up to a date the overlay covered, the overlay row is automatically hidden
+by the view (no manual reconciliation needed; `bankpd prune-overlay`
+exists for housekeeping).
+
+**`pd_input` schema** gained two provenance columns: `data_source`
+(`'crsp'` or `'bloomberg'`) and `bbg_unique_id`. Carry forward through
+the existing `daily_with_vol` → `crsp_resampled` ASOF chain.
+
+**Ticker → permco resolution** (in `bbg.import_bloomberg_excel`):
+1. Operator-supplied `--ticker-map BAC=3151` overrides
+2. Else: `crsp_ticker_hist` lookup with most recent `namedt ≤ row.date`
+3. Then `permno → permco` via the same table
+4. Unresolved tickers warn + skip (don't fail entire import)
+
+Bloomberg ticker suffix (`"BAC US Equity"`) stripped via regex before
+matching. `/` in share-class tickers normalised to `.` to match CRSP
+convention.
+
+**`retx` synthesis**: at import, for each new (permco, date), look up
+the prior trading day's market_cap in `crsp_daily ∪ existing overlay ∪
+the import batch`. Compute `mcap[t] / mcap[t-1] - 1`. If gap > 1
+calendar day, set `retx_synthetic=TRUE`. The boundary row (first
+overlay day after a multi-day WRDS gap) computes a multi-day return; one
+row's contribution to the 252-day vol window biases sE upward by ~tens
+of bps. Acceptable for the operator's stated use case (last few stale
+weeks).
+
+**Bias from weekly Bloomberg snapshots**: if Bloomberg gives weekly
+(not daily) market caps, each week's "1-day" return is really a 7-day
+return. With 4 such rows in a 252-day window, sE drift is ~10 bps in
+typical regimes. For higher precision, pull daily Bloomberg.
+
+**CLI**:
+- `bankpd import-bloomberg PATH.xlsx [--sheet 0] [--ticker-map BAC=3151] [--no-rebuild]`
+- `bankpd prune-overlay`
+
+**`inputs-status`** now reports overlay coverage:
+```
+crsp_daily_overlay: 4 rows  (4 active in view, latest 2025-01-24;
+                             pd_input rows from bloomberg: 70)
+```
+
+**Workflow**:
+```
+1. bankpd inputs-status
+2. # in Bloomberg terminal, export xlsx with the 4 columns above
+3. bankpd import-bloomberg ~/bbg.xlsx
+4. bankpd compute-weekly       # or compute --rssd ...
+```
+
+**Gotcha during implementation**: pandas Timestamp passes
+`isinstance(t, datetime.date)` (Timestamp inherits from datetime which
+inherits from date). The lookup-key normalisation for retx-merge
+required explicit `.date()` conversion via `pd.Timestamp(v).date()`.
+
+---
+
+## 2026-05-01 — split pipeline into four named tasks
+
+`run-all --scope` was confusing; split CLI into four explicit task-aligned
+commands so the operator can pick the right thing without remembering flag
+combinations:
+
+| Command | Purpose |
+|---|---|
+| `update-inputs` | Refresh FRED + CRSP + tickers for **all** link permcos, rebuild `pd_input`. Aborts on stale Y-9C. Prints freshness + coverage at the end. |
+| `compute-weekly` | Strict: compute PDs for all banks up to **last Friday**. Aborts if pd_input lacks eligible rows for last Friday or Y-9C is stale. |
+| `compute --since/--until/--rssd [--recompute]` | Flexible compute. No staleness gate. Default scope = all banks present in `pd_input`. |
+| `inputs-status` | Read-only freshness + coverage diagnostic. No fetch, no compute. |
+
+`run-all` removed.
+
+New module `bankpd/diagnostics.py` produces `CoverageReport` (output-side
+state — distinct from `freshness.FreshnessReport` which reports input
+lag). Reports:
+- `pd_input` rows, week range, distinct permcos
+- eligible / stale-Y9C / stale-CRSP / no-Y9C row counts
+- link permcos missing CRSP daily entirely
+- `pd_panel` rows + missing-from-pd_panel count
+- last-Friday-specific: eligible banks, already-computed, to-compute
+
+`compute.assemble_inputs` generalised to take `rssd_filter`,
+`week_date_max`, `exclude_existing` (in addition to existing
+`permco_filter`, `week_date_min`).
+
+Migration:
+- `run-all --scope all` → `update-inputs` then `compute-weekly`
+- `run-all --scope boa` → `compute --rssd 1073757`
+
+---
+
 ## 2026-04-30 (evening) — relax `pd_input` filters + freshness check
 
 Old `build_pd_input` dropped any week missing `sE`, `market_cap`, `total_liab`,

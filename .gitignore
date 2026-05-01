@@ -1,0 +1,63 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.ipynb_checkpoints/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+*.egg-info/
+build/
+dist/
+
+# ── Data stores ──────────────────────────────────────────────────────────────
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# ── Tabular data ─────────────────────────────────────────────────────────────
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.arrow
+*.h5
+*.hdf5
+*.dta
+*.sas7bdat
+*.xlsx
+*.xls
+
+# ── MATLAB / numpy ───────────────────────────────────────────────────────────
+*.mat
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+
+# ── Outputs ──────────────────────────────────────────────────────────────────
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+*.eps
+data/
+outputs/
+inputs/
+
+# ── Logs / temp ──────────────────────────────────────────────────────────────
+*.log
+*.tmp
+tmp/
+.DS_Store
+Thumbs.db

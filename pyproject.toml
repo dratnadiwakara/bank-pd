@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bank-pd"
+version = "0.1.0"
+description = "Weekly NP modified-Merton + classic Merton PD for listed US banks."
+requires-python = ">=3.10"
+dependencies = [
+  "duckdb>=0.10",
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "wrds>=3.2",
+  "requests>=2.31",
+  "pyyaml>=6.0",
+  "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "matplotlib>=3.7",
+  "jupyter>=1.0",
+]
+
+[project.scripts]
+bankpd = "bankpd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bankpd*"]
